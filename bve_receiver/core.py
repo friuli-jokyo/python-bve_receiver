@@ -1,11 +1,12 @@
 import dataclasses
 import logging
+import os
 import queue
 import struct
 import sys
 import threading
 from abc import ABC
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable, Optional
 
 from .atsplugin.define import *
 from .atsplugin.struct import *
@@ -27,6 +28,9 @@ class BveReceiver(ABC):
     __to_unsigned_char: struct.Struct = struct.Struct('B')
     __to_float: struct.Struct = struct.Struct('f')
     __to_double: struct.Struct = struct.Struct('d')
+
+    __input:BinaryIO
+    __record_output:Optional[BinaryIO]
 
     __queue:queue.Queue[tuple[Callable[...,None],tuple[Any,...]]]
     """BVEからの受信データのキュー"""
@@ -52,30 +56,40 @@ class BveReceiver(ABC):
     is_door_closed: bool = True
     """ドアが閉まっているかどうか"""
 
-    def __init__(self) -> None:
+    def __init__(self, input_:BinaryIO = sys.stdin.buffer, rec_file:Optional[str] = None, use_orig_cwd:bool = False) -> None:
+        if not use_orig_cwd:
+            os.chdir(os.path.dirname(os.path.abspath(sys.argv[0])))
         self.panel = [0] * 256
         self.sound = [AtsSound.STOP] * 256
         self.handles = AtsHandles(brake=0, power=0, reverser=0, constant_speed=AtsConstantSpeed.CONTINUE)
         self.keys = { key: KeyState() for key in AtsKey}
         self.horns = { horn: HornState() for horn in AtsHorn }
+        self.__input = input_
+        self.__record_output = open(rec_file, 'wb') if rec_file and "--no-rec" not in sys.argv else None
         self.__queue = queue.Queue()
         self.__thread_queue = threading.Thread(target=self.__queue_putter, daemon=True)
         self.__thread_queue.start()
 
+    def __read_from_input(self, size:int) -> bytes:
+        data = self.__input.read(size)
+        if self.__record_output:
+            self.__record_output.write(data)
+        return data
+
     def __read_int(self) -> int:
-        binary = sys.stdin.buffer.read(4)
+        binary = self.__read_from_input(4)
         return self.__to_int.unpack(binary)[0]
 
     def __read_unsigned_char(self) -> int:
-        binary = sys.stdin.buffer.read(1)
+        binary = self.__read_from_input(1)
         return self.__to_unsigned_char.unpack(binary)[0]
 
     def __read_float(self) -> float:
-        binary = sys.stdin.buffer.read(4)
+        binary = self.__read_from_input(4)
         return self.__to_float.unpack(binary)[0]
 
     def __read_double(self) -> float:
-        binary = sys.stdin.buffer.read(8)
+        binary = self.__read_from_input(8)
         return self.__to_double.unpack(binary)[0]
 
     def __queue_getter(self):
@@ -96,11 +110,11 @@ class BveReceiver(ABC):
     def __queue_putter(self):
         while True:
             try:
-                header:bytes = sys.stdin.buffer.read(1)
+                header:bytes = self.__read_from_input(1)
                 match header:
                     case b'':
                         logger.warning("BVE is closed unexpectedly")
-                        return
+                        break
                     case b'\x00':
                         self.__queue.put((self._on_load, (
                             self.__read_unsigned_char(),
@@ -109,7 +123,7 @@ class BveReceiver(ABC):
                         )))
                     case b'\x01':
                         self.__queue.put((self._on_dispose, tuple()))
-                        return
+                        break
                     case b'\x10':
                         vehicle_spec = AtsVehicleSpec(
                             self.__read_int(),
@@ -175,7 +189,14 @@ class BveReceiver(ABC):
                         raise UndefinedHeader(header)
             except UndefinedHeader:
                 logger.exception("", exc_info=True)
+                if self.__record_output:
+                    self.__record_output.close()
                 sys.exit(1)
+
+        if self.__record_output:
+            self.__record_output.close()
+
+        return
 
     def qsize(self) -> int:
         """キューのサイズ"""
